@@ -1,0 +1,5 @@
+include README.md
+include termviz.prd
+recursive-include src/termviz/helper *.plist
+recursive-include termviz_helper *.swift Package.swift
+prune termviz_helper/.build

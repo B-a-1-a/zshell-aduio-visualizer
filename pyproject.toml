@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "termviz"
+version = "0.1.0"
+description = "A macOS terminal audio visualizer for system-wide playback."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "termviz contributors" }]
+keywords = ["audio", "visualizer", "terminal", "macos", "coreaudio"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Natural Language :: English",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio :: Analysis",
+  "Topic :: Terminals",
+]
+dependencies = [
+  "blessed>=1.33,<2",
+  "click>=8.3,<9",
+  "numpy>=2.2,<2.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+]
+
+[project.scripts]
+termviz = "termviz.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+termviz = ["helper/*.plist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

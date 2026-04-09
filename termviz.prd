@@ -1,0 +1,285 @@
+# Product Requirements Document: `termviz` — macOS Terminal Audio Visualizer
+
+**Version:** 1.0 (v1)
+**Date:** April 8, 2026
+**Status:** Ready for Implementation
+
+---
+
+## 1. Product Overview
+
+`termviz` is a globally installable command-line application for macOS that transforms the terminal into a real-time audio visualizer. When the user runs the command, the terminal clears and displays an animated equalizer that reacts to whatever audio is currently playing system-wide — Spotify, YouTube, Zoom, etc. — with zero configuration.
+
+**One-liner:** `pipx install termviz && termviz`
+
+---
+
+## 2. Target User & Experience
+
+The user types `termviz`, hits Enter, and immediately sees dancing bars in their terminal. No audio driver installation, no Audio MIDI Setup, no config files. `Ctrl+C` exits cleanly and restores the terminal.
+
+---
+
+## 3. System Requirements
+
+| Requirement | Value |
+|---|---|
+| OS | macOS 14.2+ (Sonoma) |
+| Python | 3.10+ |
+| Terminal | Any that supports 256-color or truecolor (Terminal.app, iTerm2, Kitty, Alacritty, Ghostty) |
+| Permissions | "Screen & System Audio Recording" (auto-prompted on first run) |
+
+The minimum OS is **macOS 14.2**, not 13 (Ventura), due to the audio capture strategy described below.
+
+---
+
+## 4. Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    termviz CLI                       │
+│                                                     │
+│  ┌──────────┐    ┌──────────┐    ┌───────────────┐  │
+│  │  Audio    │───▶│  DSP     │───▶│  Renderer     │  │
+│  │  Capture  │    │  Pipeline│    │  (blessed)    │  │
+│  └──────────┘    └──────────┘    └───────────────┘  │
+│       │                │                │           │
+│   pyobjc +         numpy FFT      Terminal I/O     │
+│   CoreAudio                                         │
+│   Taps API                                          │
+└─────────────────────────────────────────────────────┘
+```
+
+The app is three threads communicating via lock-free ring buffers:
+
+1. **Audio Capture Thread** — Receives PCM samples from macOS.
+2. **DSP Thread** — Consumes audio, runs FFT, produces frequency band magnitudes.
+3. **Render Thread** — Reads band magnitudes, draws to terminal at the target framerate.
+
+### 4.1 Audio Capture Layer
+
+#### Critical Design Decision: Core Audio Taps, NOT ScreenCaptureKit
+
+The original plan specified ScreenCaptureKit. **This should be changed.** Here's why:
+
+- **ScreenCaptureKit is a screen recording API that happens to support audio.** It forces you to also configure a video stream (even if you set `minimumFrameInterval` absurdly high). This is wasteful overhead for an audio-only tool.
+- **There is a known, open bug (pyobjc #647) where ScreenCaptureKit audio callbacks silently fail on macOS 15 via pyobjc.** The stream either dies immediately with `SCStreamError -3805` or the `stream:didOutputSampleBuffer:ofType:` callback never fires. Native Swift implementations work, but the pyobjc bridge does not reliably deliver audio buffers. This is a showstopper.
+- **Apple introduced `AudioHardwareCreateProcessTap` in macOS 14.2 (December 2023) specifically for this use case** — capturing system audio output without virtual drivers, without muting speakers, and without the overhead of screen recording. It's a Core Audio C API, fully accessible via pyobjc's CoreAudio bridge.
+
+**Recommended approach:**
+
+Use the **Core Audio Taps API** (`AudioHardwareCreateProcessTap` + `AudioHardwareCreateAggregateDevice`) via `pyobjc-framework-CoreAudio`. The flow is:
+
+1. Create a `CATapDescription` targeting all processes (global system audio tap).
+2. Call `AudioHardwareCreateProcessTap` to instantiate the tap.
+3. Create an aggregate audio device with the tap as its sole input.
+4. Read from the aggregate device's input stream using an `AudioQueue` or `AudioUnit` callback to receive PCM float32 buffers.
+
+This approach requires the `NSAudioCaptureUsageDescription` permission (not screen recording), produces a subtle purple privacy indicator dot instead of orange, and is the same API used by professional tools like Rogue Amoeba's products and the open-source AudioTee/AudioCap projects.
+
+**Fallback consideration:** If pyobjc proves too fragile for the Core Audio Taps C API as well, the agent should consider **bundling a small Swift helper binary** (compiled at install time or pre-compiled for arm64/x86_64) that captures audio and streams raw PCM to the Python process over a Unix pipe. This is the most robust fallback. The open-source `audiotee` project (MIT-licensed, ~500 lines of Swift) demonstrates exactly this pattern and could serve as a reference or even a vendored dependency.
+
+#### Audio Format
+
+| Parameter | Value |
+|---|---|
+| Sample rate | 48,000 Hz (macOS default) |
+| Channels | Mono (stereo mixdown — halves processing) |
+| Bit depth | 32-bit float (CoreAudio native) |
+| Buffer size | 1024 samples (~21ms at 48kHz) |
+
+#### Permission Handling
+
+On first run, macOS will prompt for audio capture permission. The app should:
+
+1. Detect if permission has not yet been granted.
+2. Print a friendly one-line message: `"termviz needs audio access — approve the macOS prompt to continue."`
+3. If denied, exit with a clear message explaining how to enable it in System Settings > Privacy & Security > Screen & System Audio Recording.
+
+Note: The Core Audio Taps API does not currently expose a way to query permission status programmatically before attempting capture. The app should attempt to start the tap, detect silence or an error code, and guide the user accordingly.
+
+### 4.2 DSP Pipeline
+
+All signal processing runs in a dedicated thread consuming from a ring buffer.
+
+**Processing chain per frame:**
+
+1. **Windowing:** Apply a Hann window to the 1024-sample buffer to reduce spectral leakage.
+2. **FFT:** `numpy.fft.rfft` on the windowed buffer → 513 complex frequency bins (0 Hz to 24 kHz).
+3. **Magnitude:** `numpy.abs()` on the FFT output → power spectrum.
+4. **Band mapping:** Group the 513 bins into N bands (where N = number of visual bars, derived from terminal width). Use **logarithmic spacing** so that bass frequencies get proportionally more bins — this matches human perception. A reasonable default is mel-scale-inspired bin groupings.
+5. **Smoothing:** Apply exponential moving average (EMA) with a configurable decay factor (default ~0.3) to prevent jittery bars. `smoothed[i] = alpha * new[i] + (1 - alpha) * smoothed[i]`.
+6. **Normalization:** Scale magnitudes to 0.0–1.0 range. Use adaptive peak tracking (slow decay of observed max) rather than a fixed ceiling, so the visualizer responds well to both quiet jazz and loud EDM.
+
+**Output:** An array of N float values (0.0–1.0), one per bar.
+
+### 4.3 Rendering Layer
+
+#### Library Choice: `blessed`
+
+Use `blessed` (Python TUI library) for terminal rendering. Rationale:
+
+- Lightweight, minimal dependency tree.
+- Direct cursor control and color formatting without curses boilerplate.
+- Sufficient for this use case — we're drawing rectangles, not building a widget tree.
+
+`Textual` is overkill for v1 (CSS engine, widget system, event loop). Reserve it for a future version if interactive menus or settings panels are needed.
+
+#### Render Loop
+
+Target: **30 FPS** (33ms per frame). This is the sweet spot — smooth enough to feel reactive, low enough to avoid excessive CPU on older machines.
+
+Each frame:
+
+1. Read the latest band magnitudes from the DSP output buffer.
+2. Calculate bar heights: `height[i] = magnitude[i] * terminal_rows`.
+3. For each bar, draw from the bottom of the terminal upward using block characters.
+4. Apply color gradient based on bar height (bass = warm colors, treble = cool colors).
+5. Write the entire frame buffer to stdout in a single `sys.stdout.write()` call to avoid tearing.
+
+#### Visual Design
+
+```
+     ██
+     ██  ██
+  ██ ██  ██
+  ██ ██  ██ ██
+  ██ ██  ██ ██      ██
+  ██ ██  ██ ██  ██  ██
+  ██ ██  ██ ██  ██  ██  ██
+  ██ ██  ██ ██  ██  ██  ██  ██
+```
+
+- **Bar character:** Full block `█` (U+2588) with half-block `▄` (U+2584) for sub-character-height precision, effectively doubling vertical resolution.
+- **Bar width:** 2 characters per bar with 1 character gap. Auto-calculate bar count from `terminal_columns // 3`.
+- **Color:** Vertical gradient per bar. Bottom = deep blue/purple, mid = cyan/green, top = yellow/red. Use truecolor (24-bit) ANSI escape sequences with a 256-color fallback.
+- **Responsiveness:** On `SIGWINCH` (terminal resize), immediately recalculate bar count and height.
+
+---
+
+## 5. CLI Interface
+
+```
+Usage: termviz [OPTIONS]
+
+Options:
+  --fps INTEGER        Target framerate (default: 30, range: 10-60)
+  --bars INTEGER       Number of bars (default: auto from terminal width)
+  --color SCHEME       Color scheme: "spectrum" | "mono" | "fire" | "ice"
+                       (default: spectrum)
+  --sensitivity FLOAT  Audio sensitivity multiplier (default: 1.0)
+  --no-color           Disable colors, use plain block characters
+  --version            Show version and exit
+  --help               Show this message and exit
+```
+
+The CLI should be built with `click` or `typer`.
+
+---
+
+## 6. Packaging & Distribution
+
+### pyproject.toml structure
+
+```
+termviz/
+├── pyproject.toml
+├── README.md
+├── LICENSE
+└── src/
+    └── termviz/
+        ├── __init__.py
+        ├── __main__.py       # entry point
+        ├── cli.py            # click/typer CLI definition
+        ├── capture.py        # Core Audio Taps bridge
+        ├── dsp.py            # FFT + band mapping + smoothing
+        ├── renderer.py       # blessed-based terminal drawing
+        ├── ring_buffer.py    # lock-free ring buffer
+        ├── colors.py         # color scheme definitions
+        └── config.py         # runtime config dataclass
+```
+
+### Dependencies
+
+```toml
+[project]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "blessed>=1.20",
+    "click>=8.0",
+    "pyobjc-framework-CoreAudio>=10.0",
+    "pyobjc-core>=10.0",
+]
+```
+
+### Installation
+
+Primary: `pipx install termviz`
+Alternative: `pip install termviz`
+Entry point: `termviz` (defined in `[project.scripts]`)
+
+---
+
+## 7. Key Technical Risks & Mitigations
+
+| Risk | Severity | Mitigation |
+|---|---|---|
+| **pyobjc CoreAudio Taps API may have similar callback issues to ScreenCaptureKit** | High | Prototype the capture layer first in isolation. If pyobjc can't reliably receive audio callbacks, fall back to a bundled Swift helper binary that pipes PCM to Python over stdin. See `audiotee` and `AudioCap` as reference implementations. |
+| **Permission prompt UX is opaque** | Medium | Detect the failure mode (silence or error) and print actionable instructions. Consider adding `termviz --check` that tests audio capture and reports status. |
+| **CPU usage too high for 30fps rendering + FFT** | Low | numpy FFT on 1024 samples is sub-millisecond. blessed string writes are fast. Profile early. If needed, drop to 20fps or use `scipy.fft` for real-valued optimization. |
+| **Terminal doesn't support truecolor** | Low | Detect `$COLORTERM` env var. Fall back to 256-color, then to 16-color. `blessed` handles capability detection. |
+| **Non-bundled executables may not appear in macOS privacy settings (macOS 26+)** | Medium | Apple is tightening permissions for non-bundled executables. If this becomes an issue, the app may need to be wrapped in a minimal `.app` bundle distributed via Homebrew cask. Monitor Apple developer forums. |
+
+---
+
+## 8. Implementation Order for the Coding Agent
+
+Build and test in this exact sequence. Each step should be independently runnable and verifiable.
+
+### Phase 1: Audio Capture Proof-of-Concept
+1. Write `capture.py` that uses pyobjc to call `AudioHardwareCreateProcessTap` and receive PCM buffers.
+2. Verify by writing captured audio to a WAV file and playing it back.
+3. **If this fails:** Build a minimal Swift CLI (`termviz-helper`) that captures audio via Core Audio Taps and writes raw PCM float32 to stdout. Have `capture.py` launch it as a subprocess and read from its stdout.
+
+### Phase 2: DSP Pipeline
+4. Write `dsp.py` with the FFT → band mapping → smoothing chain.
+5. Test by feeding a known sine wave and verifying the correct bin lights up.
+
+### Phase 3: Terminal Renderer
+6. Write `renderer.py` using `blessed` that draws bars from a hardcoded array of magnitudes.
+7. Add color gradient support and terminal resize handling.
+
+### Phase 4: Integration
+8. Wire capture → DSP → renderer with threading and ring buffers.
+9. Add the CLI with `click`.
+10. Add graceful shutdown on `Ctrl+C` (restore terminal state, stop audio tap, destroy aggregate device).
+
+### Phase 5: Polish
+11. Add `--sensitivity`, `--fps`, `--bars`, and `--color` options.
+12. Add `termviz --check` for permission diagnostics.
+13. Write pyproject.toml, test `pipx install .` locally.
+14. Write README with a GIF demo placeholder.
+
+---
+
+## 9. Out of Scope for v1
+
+- Microphone input (mic capture is a different permission and use case)
+- Per-application audio filtering (capture everything for now)
+- Windows or Linux support
+- Interactive TUI menus or settings
+- Audio recording/export
+- Waveform or spectrogram modes (only EQ bars for v1)
+- Homebrew formula (do this after v1 is stable)
+
+---
+
+## 10. Reference Materials
+
+- **AudioCap** (Swift, MIT): `github.com/insidegui/AudioCap` — Best reference for Core Audio Taps setup, including permission probing.
+- **AudioTee** (Swift, MIT): `github.com/makeusabrew/audiotee` — Minimal CLI that pipes system audio to stdout. Directly usable as a fallback helper binary.
+- **ProcTap** (Python): `github.com/m96-chan/ProcTap` — Python library with a ScreenCaptureKit backend for macOS. Check if their approach works before building from scratch.
+- **Apple WWDC22 "Meet ScreenCaptureKit"**: Background context on the framework (but use Core Audio Taps instead).
+- **Apple Docs**: `developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps` — Official (sparse) documentation. The C header files (`AudioHardware.h`, `AudioHardwareTapping.h`) contain the real documentation.
+- **pyobjc Issue #647**: `github.com/ronaldoussoren/pyobjc/issues/647` — Documents the ScreenCaptureKit audio callback failure on macOS 15. Confirms why we avoid SCK.
