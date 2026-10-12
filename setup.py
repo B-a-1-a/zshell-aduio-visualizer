@@ -19,7 +19,7 @@ ROOT = Path(__file__).parent.resolve()
 HELPER_SOURCE_ROOT = ROOT / "termviz_helper"
 HELPER_BINARY_NAME = "termviz-helper"
 HELPER_APP_NAME = "termviz-helper.app"
-MINIMUM_MACOS_WHEEL_TAG = "14_2"
+MINIMUM_MACOS_WHEEL_TAG = "14_0"
 
 
 class BuildTermvizHelper(build_py):

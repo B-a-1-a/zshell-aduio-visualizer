@@ -7,6 +7,8 @@ name = "termviz"
 version = "0.1.0"
 description = "A macOS terminal audio visualizer for system-wide playback."
 readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "termviz contributors" }]
 keywords = ["audio", "visualizer", "terminal", "macos", "coreaudio"]
@@ -34,6 +36,11 @@ dependencies = [
 dev = [
   "pytest>=8.3,<9",
 ]
+
+[project.urls]
+Homepage = "https://github.com/B-a-1-a/zshell-aduio-visualizer"
+Repository = "https://github.com/B-a-1-a/zshell-aduio-visualizer"
+Issues = "https://github.com/B-a-1-a/zshell-aduio-visualizer/issues"
 
 [project.scripts]
 termviz = "termviz.cli:main"
